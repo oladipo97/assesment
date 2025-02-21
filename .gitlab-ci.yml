@@ -1,0 +1,191 @@
+image:
+  name: hashicorp/terraform:1.9
+  entrypoint: [""]
+
+variables:
+  TF_VAR_cloudflare_api_token: ${CLOUDFLARE_API_TOKEN}
+  TF_VAR_commit_sha: ${CI_COMMIT_SHA}
+
+# By default, GitLab will run duplicate pipelines - one for the branch commit, one for merge requests on the branch.
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"' # MR pipelines always get to run
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH # Run when merged to default branch (i.e. after MR is merged)
+
+stages:
+  - setup
+  - build artifacts
+  - plan
+  - apply
+  - deploy
+
+.default:
+  tags:
+    - aws
+
+.plan_script:
+  before_script:
+    - 'git config --global url."https://${CI_GIT_USERNAME}:${CI_GIT_TOKEN}@gitlab.com".insteadOf ssh://git@gitlab.com'
+  script:
+    - terraform init
+    - terraform validate
+    - terraform workspace select ${ENVIRONMENT}
+    - terraform plan -var-file=tfvars/${ENVIRONMENT}.tfvars -lock=false -input=false
+
+.apply_script:
+  before_script:
+    - 'git config --global url."https://${CI_GIT_USERNAME}:${CI_GIT_TOKEN}@gitlab.com".insteadOf ssh://git@gitlab.com'
+  script:
+    - terraform init
+    - terraform validate
+    - terraform workspace select ${ENVIRONMENT}
+    - terraform plan -var-file=tfvars/${ENVIRONMENT}.tfvars -input=false -out=plan.json
+    - terraform apply -input=false -auto-approve plan.json
+
+###################
+
+setup:env:
+  extends: .default
+  stage: setup
+  image:
+    name: ruby:3.1.0-bullseye
+    entrypoint: [""]
+  script:
+    - wget https://github.com/Droplr/aws-env/raw/master/bin/aws-env-linux-amd64 -O /bin/aws-env
+    - chmod +x /bin/aws-env
+    - aws-env --recursive >aws-with-dashes.env
+    - cat aws-with-dashes.env | ruby -e 'ARGF.each_line {|line| a=line.split("=",2);printf("#{a[0].gsub(/-/,"_")}=#{a[1]}")}' >aws.env
+  variables:
+    AWS_REGION: us-east-2
+    AWS_ENV_PATH: /service
+  artifacts:
+    paths:
+      - aws.env
+
+build:auth0-events-transform-lambda:
+  extends: .default
+  stage: build artifacts
+  image:
+    name: python:3.10-slim-bullseye
+    entrypoint: [""]
+  script:
+    - apt-get update; apt-get -y install curl; apt-get -y install unzip; apt-get -y install zip
+    - source aws.env
+    - cd modules/auth0/transform-lambda
+    - pip install --target ./build -r requirements.txt
+    - cp auth0_transform.py build/
+    - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+    - unzip -qq awscliv2.zip
+    - ./aws/install
+    - cd build
+    - zip -r ${CI_COMMIT_SHA}.zip .
+    - aws s3 cp ${CI_COMMIT_SHA}.zip s3://${auth0_events_transform_lambda_artifact_bucket}/${CI_COMMIT_SHA}.zip
+
+plan:dev:
+  stage: plan
+  variables:
+    ENVIRONMENT: dev
+    TF_VAR_auth0_tenant_domain: ${AUTH0_TENANT_DOMAIN_DEV}
+    TF_VAR_auth0_client_id: ${AUTH0_CLIENT_ID_DEV}
+    TF_VAR_auth0_client_secret: ${AUTH0_CLIENT_SECRET_DEV}
+  extends: [.default, .plan_script]
+  rules:
+    - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH'
+
+plan:staging:
+  stage: plan
+  variables:
+    ENVIRONMENT: staging
+    TF_VAR_auth0_tenant_domain: ${AUTH0_TENANT_DOMAIN_STAGING}
+    TF_VAR_auth0_client_id: ${AUTH0_CLIENT_ID_STAGING}
+    TF_VAR_auth0_client_secret: ${AUTH0_CLIENT_SECRET_STAGING}
+  extends: [.default, .plan_script]
+  rules:
+    - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH'
+
+plan:production:
+  stage: plan
+  variables:
+    ENVIRONMENT: production
+    TF_VAR_auth0_tenant_domain: ${AUTH0_TENANT_DOMAIN_PRODUCTION}
+    TF_VAR_auth0_client_id: ${AUTH0_CLIENT_ID_PRODUCTION}
+    TF_VAR_auth0_client_secret: ${AUTH0_CLIENT_SECRET_PRODUCTION}
+  extends: [.default, .plan_script]
+  rules:
+    - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH'
+
+###################
+
+apply:dev:
+  stage: apply
+  variables:
+    ENVIRONMENT: dev
+    TF_VAR_auth0_tenant_domain: ${AUTH0_TENANT_DOMAIN_DEV}
+    TF_VAR_auth0_client_id: ${AUTH0_CLIENT_ID_DEV}
+    TF_VAR_auth0_client_secret: ${AUTH0_CLIENT_SECRET_DEV}
+  extends: [.default, .apply_script]
+  rules:
+    - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true
+
+apply:staging:
+  stage: apply
+  variables:
+    ENVIRONMENT: staging
+    TF_VAR_auth0_tenant_domain: ${AUTH0_TENANT_DOMAIN_STAGING}
+    TF_VAR_auth0_client_id: ${AUTH0_CLIENT_ID_STAGING}
+    TF_VAR_auth0_client_secret: ${AUTH0_CLIENT_SECRET_STAGING}
+  extends: [.default, .apply_script]
+  rules:
+    - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true
+
+apply:production:
+  stage: apply
+  variables:
+    ENVIRONMENT: production
+    TF_VAR_auth0_tenant_domain: ${AUTH0_TENANT_DOMAIN_PRODUCTION}
+    TF_VAR_auth0_client_id: ${AUTH0_CLIENT_ID_PRODUCTION}
+    TF_VAR_auth0_client_secret: ${AUTH0_CLIENT_SECRET_PRODUCTION}
+  extends: [.default, .apply_script]
+  rules:
+    - if: '$CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH'
+      when: manual
+      allow_failure: true
+
+###################
+
+deploy:dev:
+  stage: deploy
+  variables:
+    ENVIRONMENT: dev
+    TF_VAR_auth0_tenant_domain: ${AUTH0_TENANT_DOMAIN_DEV}
+    TF_VAR_auth0_client_id: ${AUTH0_CLIENT_ID_DEV}
+    TF_VAR_auth0_client_secret: ${AUTH0_CLIENT_SECRET_DEV}
+  extends: [.default, .apply_script]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+deploy:staging:
+  stage: deploy
+  variables:
+    ENVIRONMENT: staging
+    TF_VAR_auth0_tenant_domain: ${AUTH0_TENANT_DOMAIN_STAGING}
+    TF_VAR_auth0_client_id: ${AUTH0_CLIENT_ID_STAGING}
+    TF_VAR_auth0_client_secret: ${AUTH0_CLIENT_SECRET_STAGING}
+  extends: [.default, .apply_script]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+deploy:production:
+  stage: deploy
+  variables:
+    ENVIRONMENT: production
+    TF_VAR_auth0_tenant_domain: ${AUTH0_TENANT_DOMAIN_PRODUCTION}
+    TF_VAR_auth0_client_id: ${AUTH0_CLIENT_ID_PRODUCTION}
+    TF_VAR_auth0_client_secret: ${AUTH0_CLIENT_SECRET_PRODUCTION}
+  extends: [.default, .apply_script]
+  rules:
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'

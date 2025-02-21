@@ -1,0 +1,4 @@
+FROM linuxserver/wireguard:latest
+COPY generate_config_docker.sh /opt/generate_config.sh
+RUN apk update && apk add zip
+ENTRYPOINT ["/opt/generate_config.sh"]

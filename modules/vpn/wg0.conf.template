@@ -1,0 +1,15 @@
+[Interface]
+Address = ${private_network_prefix}.1/24
+PrivateKey = ${private_key}
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ens5 -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ens5 -j MASQUERADE
+ListenPort = 51820
+
+%{ for peer in peers ~}
+# ${peer.comment}
+[Peer]
+PublicKey = ${peer.public_key}
+AllowedIPs = ${private_network_prefix}.${peer.last_ip_octet}/32
+PersistentKeepalive = 25
+
+%{ endfor ~}
